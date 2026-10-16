@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b6b45">
+<title>Aayuvridhi</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,600;12..96,700;12..96,800&family=Hind:wght@400;500;600&family=IBM+Plex+Mono:wght@500;600&display=swap">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<!--APP-->
+<div class="stage">
+  <aside class="guide" aria-label="Demo guide">
+    <div class="guide-card">
+      <div class="brandmark"><span id="guideLogo"></span><span>Aayuvridhi</span></div>
+      <p class="muted">One patient. One connected healthcare journey. This is a working MVP: every tap below runs real backend logic.</p>
+      <div class="stack tight"><span class="eyebrow">Demo logins · OTP 123456</span>
+        <span><strong>98765 00001</strong> Rajesh, Family Leader</span>
+        <span><strong>98765 00003</strong> Kamla Devi, senior patient</span></div>
+      <div class="stack tight"><span class="eyebrow">Try these journeys</span>
+        <ol>
+          <li>Home: see Kamla’s missed dose escalated to Rajesh</li>
+          <li>Find care → book Dr. Anil Mehta for Kamla → join the video consult → sign the e-prescription</li>
+          <li>Order from that prescription → watch the delivery → enter the OTP</li>
+          <li>Records → Kamla → HbA1c trend and lifelong timeline</li>
+          <li>Hold SOS for 3 seconds as Kamla, then log in as Rajesh</li>
+          <li>Dadi Ke Nuskhe → type “chest pain”</li>
+          <li>Profile → Trust &amp; operations → verify a pending doctor</li>
+        </ol></div>
+      <p class="xs muted">Clinics and pharmacies auto-respond after a few seconds in demo mode. Use Profile → Partner console to play them yourself.</p>
+    </div>
+  </aside>
+  <div class="app">
+    <header class="topbar" id="topbar" hidden></header>
+    <main id="view" tabindex="-1"></main>
+    <nav class="tabbar" id="tabbar" hidden aria-label="Main">
+      <a href="#/home" data-tab="home"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M10 21v-6h4v6"/></svg>Home</a>
+      <a href="#/book?type=doctor" data-tab="care"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 21s-7-4.4-7-10.2A4.3 4.3 0 0 1 12 8a4.3 4.3 0 0 1 7 2.8C19 16.6 12 21 12 21z"/><path d="M12 11v5M9.5 13.5h5"/></svg>Care</a>
+      <a href="#/family" data-tab="family"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="8" r="3"/><circle cx="17" cy="9" r="2.5"/><path d="M2.5 20c.6-3.5 2.8-5.5 5.5-5.5s4.9 2 5.5 5.5"/><path d="M14 15.2c.9-.5 1.9-.7 3-.7 2.3 0 4 1.6 4.5 4.5"/></svg>Family</a>
+      <a href="#/records" data-tab="records"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 3h7l5 5v13H7z"/><path d="M14 3v5h5"/><path d="M10 13h6M10 17h6"/></svg>Records</a>
+      <a href="#/wallet" data-tab="wallet"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="6" width="18" height="14" rx="3"/><path d="M3 10h18"/><path d="M16 15h2"/></svg>Wallet</a>
+    </nav>
+  </div>
+</div>
+<!--/APP-->
+<script src="js/lib.js"></script>
+<script src="js/screens-home.js"></script>
+<script src="js/screens-care.js"></script>
+<script src="js/screens-pharmacy.js"></script>
+<script src="js/screens-family.js"></script>
+<script src="js/screens-records.js"></script>
+<script src="js/screens-more.js"></script>
+<script src="js/main.js"></script>
+</body>
+</html>

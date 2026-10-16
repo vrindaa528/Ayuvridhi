@@ -1,0 +1,17 @@
+{
+  "name": "aayuvridhi",
+  "version": "1.0.0",
+  "description": "Aayuvridhi — One Patient. One Connected Healthcare Journey. Full-stack MVP: medicine reminders, virtual doctor + pharmacy, smart booking, family mode, wallet, lifelong records, SOS and Dadi Ke Nuskhe.",
+  "main": "server/index.js",
+  "private": true,
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "start": "node --no-warnings server/index.js",
+    "dev": "node --no-warnings --watch server/index.js",
+    "test": "node --no-warnings --test tests/*.test.js",
+    "build:prototype": "node scripts/build-prototype.js"
+  },
+  "license": "UNLICENSED"
+}
