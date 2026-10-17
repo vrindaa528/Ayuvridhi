@@ -121,30 +121,41 @@ route('/wellness', 'Daily wellness', async (el) => {
   $('#add', el).onsubmit = async (e) => { e.preventDefault(); const t = $('#t', el).value.trim(); if (!t) return; await act(e.submitter, () => POST('/api/wellness/routines', { title: t, target: 1, unit: 'today', icon: 'spark' }), 'Routine added'); render(); };
 });
 
+const CONSOLE_ROLES = [['doctor', 'Doctor'], ['lab', 'Lab'], ['clinic_staff', 'Clinic desk'], ['pharmacy', 'Pharmacy'], ['rider', 'Delivery rider']];
 route('/console', 'Partner console', async (el) => {
   const tpl = (await GET('/api/consultations/templates')).items;
+  const role = S.consoleRole;
+  const isBookingRole = ['doctor', 'lab', 'clinic_staff'].includes(role);
   async function draw() {
-    const q = await GET('/api/provider/queue');
+    let q;
+    try { q = await GET('/api/provider/queue'); } catch (e) {
+      el.innerHTML = `<div class="banner warn">${ic('console')}<div class="small">${esc(e.message)}</div></div>`;
+      return;
+    }
+    const bookings = isBookingRole ? q.bookings : [];
+    const orders = isBookingRole ? [] : q.orders;
     el.innerHTML = `
-      <div class="banner info">${ic('console')}<div class="small">Demo console. In production each clinic, doctor, lab, pharmacy and delivery partner works in their own app; here you can play every role to move a booking or order forward.</div></div>
-      <section class="section"><div class="section-head"><h2>Clinic, lab & doctor</h2><span class="small muted">${q.bookings.length} active</span></div>
-        ${q.bookings.map((b) => `<div class="card"><div class="row between top"><div class="stack tight"><strong>${esc(b.provider_name)}</strong><span class="small muted">${esc(b.service)} · ${esc(b.patient_name)} · ${b.start_at ? dayLabel(b.start_at) + ' ' + tm(b.start_at) : ''}</span></div>${bookingPill(b.status)}</div>
+      <div class="banner info">${ic('console')}<div class="small">Demo console. Each role signs in as its own seeded staff account and can only act on its own provider records. In production every role has its own app and login.</div></div>
+      <div class="row wrap" role="group" aria-label="Choose role">
+        ${CONSOLE_ROLES.map(([k, label]) => `<button class="btn sm ${k === role ? 'primary' : ''}" data-role="${k}" aria-pressed="${k === role}">${label}</button>`).join('')}
+      </div>
+      <section class="section"><div class="section-head"><h2>${isBookingRole ? 'Bookings' : 'Orders & deliveries'}</h2><span class="small muted">${isBookingRole ? bookings.length : orders.length} active</span></div>
+        ${isBookingRole ? bookings.map((b) => `<div class="card"><div class="row between top"><div class="stack tight"><strong>${esc(b.provider_name)}</strong><span class="small muted">${esc(b.service)} · ${esc(b.patient_name)} · ${b.start_at ? dayLabel(b.start_at) + ' ' + tm(b.start_at) : ''}</span></div>${bookingPill(b.status)}</div>
           <div class="row wrap">
             ${b.status === 'requested' ? `<button class="btn sm primary" data-bk="confirm" data-id="${b.id}">Confirm & issue token</button><button class="btn sm" data-bk="reject" data-id="${b.id}">Can’t take it</button>` : ''}
-            ${b.provider_type === 'doctor' && ['confirmed', 'checked_in', 'in_consult'].includes(b.status) ? `<button class="btn sm" data-rx="${b.id}" data-spec="${esc(b.provider_name)}">Write prescription</button>` : ''}
-            ${b.provider_type === 'lab' && ['confirmed', 'checked_in'].includes(b.status) ? `<button class="btn sm primary" data-bk="report" data-id="${b.id}">Sample done · upload report</button>` : ''}
-          </div></div>`).join('') || '<div class="card"><div class="empty">No bookings waiting. Book a doctor or lab test from the app.</div></div>'}
-      </section>
-      <section class="section"><div class="section-head"><h2>Pharmacy & delivery</h2><span class="small muted">${q.orders.length} active</span></div>
-        ${q.orders.map((o) => `<div class="card"><div class="row between top"><div class="stack tight"><strong>${esc(o.pharmacy_name)}</strong><span class="small muted">${esc(o.patient_name)} · ${o.items.map((i) => esc(i.drug) + ' ×' + i.qty).join(', ')}</span></div>${orderPill(o.status)}</div>
+            ${role === 'doctor' && ['confirmed', 'checked_in', 'in_consult'].includes(b.status) ? `<button class="btn sm" data-rx="${b.id}" data-spec="${esc(b.provider_name)}">Write prescription</button>` : ''}
+            ${role === 'lab' && ['confirmed', 'checked_in'].includes(b.status) ? `<button class="btn sm primary" data-bk="report" data-id="${b.id}">Sample done · upload report</button>` : ''}
+          </div></div>`).join('') || '<div class="card"><div class="empty">No bookings waiting for this role. Book a doctor or lab test from the app.</div></div>'
+        : orders.map((o) => `<div class="card"><div class="row between top"><div class="stack tight"><strong>${esc(o.pharmacy_name)}</strong><span class="small muted">${esc(o.patient_name)} · ${o.items.map((i) => esc(i.drug) + ' ×' + i.qty).join(', ')}</span></div>${orderPill(o.status)}</div>
           <div class="row wrap">
-            ${o.status === 'placed' ? `<button class="btn sm primary" data-or="verify" data-id="${o.id}">Verify prescription</button><button class="btn sm" data-sub="${o.id}" data-drug="${esc(o.items[0] ? o.items[0].drug : '')}" data-price="${o.items[0] ? Math.round(o.items[0].unit_price * 0.6 * 100) / 100 : 0}">Suggest generic for ${esc(o.items[0] ? o.items[0].drug : '')}</button>` : ''}
-            ${o.status === 'verified' ? `<button class="btn sm primary" data-or="dispatch" data-id="${o.id}">Pack & dispatch</button>` : ''}
-            ${['dispatched', 'arrived'].includes(o.status) ? `<input class="input mono" style="width:110px;min-height:32px" placeholder="OTP" id="otp-${o.id}" aria-label="OTP from patient"><button class="btn sm primary" data-hand="${o.id}">Hand over</button>` : ''}
-          </div></div>`).join('') || '<div class="card"><div class="empty">No medicine orders in progress.</div></div>'}
+            ${role === 'pharmacy' && o.status === 'placed' ? `<button class="btn sm primary" data-or="verify" data-id="${o.id}">Verify prescription</button><button class="btn sm" data-sub="${o.id}" data-drug="${esc(o.items[0] ? o.items[0].drug : '')}" data-price="${o.items[0] ? Math.round(o.items[0].unit_price * 0.6 * 100) / 100 : 0}">Suggest generic for ${esc(o.items[0] ? o.items[0].drug : '')}</button>` : ''}
+            ${role === 'pharmacy' && o.status === 'verified' ? `<button class="btn sm primary" data-or="dispatch" data-id="${o.id}">Pack & dispatch</button>` : ''}
+            ${['dispatched', 'arrived'].includes(o.status) && (role === 'rider' || role === 'pharmacy') ? `<input class="input mono" style="width:110px;min-height:32px" placeholder="OTP" id="otp-${o.id}" aria-label="OTP from patient"><button class="btn sm primary" data-hand="${o.id}">Hand over</button>` : ''}
+          </div></div>`).join('') || '<div class="card"><div class="empty">No orders in progress for this role.</div></div>'}
       </section>`;
   }
   await draw();
+  on(el, '[data-role]', 'click', async (e, b) => { S.consoleRole = b.dataset.role; go('#/console'); });
   on(el, '[data-bk]', 'click', async (e, b) => { await act(b, () => POST(`/api/provider/bookings/${b.dataset.id}/${b.dataset.bk}`, {}), b.dataset.bk === 'confirm' ? 'Booking confirmed' : b.dataset.bk === 'report' ? 'Report sent to patient records' : 'Booking declined · patient refunded'); draw(); });
   on(el, '[data-or]', 'click', async (e, b) => { await act(b, () => POST(`/api/provider/orders/${b.dataset.id}/${b.dataset.or}`, {}), b.dataset.or === 'verify' ? 'Prescription verified' : 'Dispatched'); draw(); });
   on(el, '[data-sub]', 'click', async (e, b) => { await act(b, () => POST(`/api/provider/orders/${b.dataset.sub}/verify`, { substitute: { from: b.dataset.drug, to: b.dataset.drug + ' (generic)', unit_price: Number(b.dataset.price) } }), 'Substitute sent for patient approval'); draw(); });

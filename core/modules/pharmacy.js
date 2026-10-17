@@ -3,7 +3,18 @@
 // substitution only) → dispatch with live tracking → OTP handover → patient
 // confirmation releases the escrowed payment.
 
-const { must, json, haversineKm, travelMinutes, addMinutes, localDay } = require('../util');
+const { must, json, haversineKm, travelMinutes, addMinutes, localDay, safeEqual } = require('../util');
+
+// Delivery OTP: 4 digits derived from a server-held key, the order id and the
+// dispatch time. Nothing that reveals the code is stored: the database keeps
+// only a keyed hash for checking, and the patient view re-derives the code
+// while the delivery is live (see getOrder).
+const HANDOVER_TTL_MIN = 12 * 60;
+function handoverCode(c, orderId, dispatchedAt) {
+  const h = c.keyed(`handover|${orderId}|${dispatchedAt}`);
+  return String(1000 + (parseInt(h.slice(0, 8), 16) % 9000));
+}
+const handoverCheck = (c, orderId, code) => c.keyed(`handover-check|${orderId}|${code}`);
 
 // Drug master. rx: prescription required. unit price in ₹ (MRP basis).
 const DRUGS = {
@@ -220,38 +231,51 @@ function register(r, c) {
   });
 
   // ---- Pharmacy and delivery-partner side (Provider Console in the demo).
-  r.post('/api/provider/orders/:id/verify', ({ params, body }) => {
+  // Pharmacy staff act only on orders their pharmacy received.
+  r.post('/api/provider/orders/:id/verify', { roles: ['pharmacy'] }, ({ user, params, body, ip }) => {
     const o = getOrder(params.id);
-    must(o && o.status === 'placed', 400, 'Order is not awaiting verification');
+    must(o, 404, 'Order not found');
+    c.access.assertOwns(user, o.pharmacy_id);
+    must(o.status === 'placed', 400, 'Order is not awaiting verification');
     verify(o, body.substitute);
+    c.audit(user, 'order.verify', o.patient_id, ip, `order ${o.id}${body.substitute ? ' (substitute suggested)' : ''}`);
     return getOrder(o.id);
   });
 
-  r.post('/api/provider/orders/:id/dispatch', ({ params }) => {
+  r.post('/api/provider/orders/:id/dispatch', { roles: ['pharmacy'] }, ({ user, params, ip }) => {
     const o = getOrder(params.id);
-    must(o && o.status === 'verified', 400, 'Verify the order before dispatch');
+    must(o, 404, 'Order not found');
+    c.access.assertOwns(user, o.pharmacy_id);
+    must(o.status === 'verified', 400, 'Verify the order before dispatch');
     dispatch(o);
+    c.audit(user, 'order.dispatch', o.patient_id, ip, `order ${o.id}`);
     return getOrder(o.id);
   });
 
-  r.post('/api/provider/orders/:id/handover', ({ params, body }) => {
+  // A rider linked to the pharmacy (or the pharmacy itself) hands the order over.
+  r.post('/api/provider/orders/:id/handover', { roles: ['rider', 'pharmacy'] }, ({ user, params, body, ip }) => {
     const o = getOrder(params.id);
-    must(o && ['dispatched', 'arrived'].includes(o.status), 400, 'Order is not out for delivery');
+    must(o, 404, 'Order not found');
+    c.access.assertOwns(user, o.pharmacy_id);
+    must(['dispatched', 'arrived'].includes(o.status), 400, 'Order is not out for delivery');
     const d = db.get('SELECT * FROM deliveries WHERE order_id = ?', [o.id]);
     must(d.otp_attempts < 3, 423, 'Handover blocked after 3 wrong OTPs. Ops team alerted.');
     const stored = db.get('SELECT otp_hash FROM orders WHERE id = ?', [o.id]).otp_hash;
-    const ok = !!stored && c.deps.hash(String(body.otp || '')) === stored;
+    const ok = !!stored && safeEqual(handoverCheck(c, o.id, String(body.otp || '')), stored);
     if (!ok) {
       db.run('UPDATE deliveries SET otp_attempts = otp_attempts + 1 WHERE order_id = ?', [o.id]);
       if (d.otp_attempts + 1 >= 3) {
         db.run("UPDATE deliveries SET status = 'blocked' WHERE order_id = ?", [o.id]);
         c.log('ops', `Order ${o.id}: handover blocked after 3 wrong OTPs`);
+        c.audit(user, 'handover.blocked', o.patient_id, ip, `order ${o.id}`);
       }
+      c.audit(user, 'handover.wrong_otp', o.patient_id, ip, `order ${o.id}`);
       must(false, 400, `Wrong OTP (${2 - d.otp_attempts} attempt(s) left)`);
     }
     const now = c.now().toISOString();
     db.run("UPDATE orders SET status = 'delivered', updated_at = ? WHERE id = ?", [now, o.id]);
     db.run("UPDATE deliveries SET status = 'delivered' WHERE order_id = ?", [o.id]);
+    c.audit(user, 'handover.delivered', o.patient_id, ip, `order ${o.id}`);
     c.events.emit('order.delivered', { order_id: o.id });
     return getOrder(o.id, true);
   });
@@ -288,19 +312,21 @@ function register(r, c) {
     const km = haversineKm(d.from_lat, d.from_lng, d.to_lat, d.to_lng);
     let eta = travelMinutes(km);
     if (c.deps.maxDemoEtaMin) eta = Math.min(eta, c.deps.maxDemoEtaMin);
-    const otp = String(Math.floor(1000 + Math.random() * 9000));
+    const dispatchedAt = now.toISOString();
+    const otp = handoverCode(c, o.id, dispatchedAt);
     const partners = ['Ravi S.', 'Imran K.', 'Sandeep P.', 'Mahesh T.'];
-    db.run("UPDATE orders SET status = 'dispatched', otp_hash = ?, otp_plain = ?, updated_at = ? WHERE id = ?", [c.deps.hash(otp), otp, now.toISOString(), o.id]);
+    db.run("UPDATE orders SET status = 'dispatched', otp_hash = ?, updated_at = ? WHERE id = ?", [handoverCheck(c, o.id, otp), dispatchedAt, o.id]);
     db.run("UPDATE deliveries SET status = 'on_the_way', partner = ?, dispatched_at = ?, eta_at = ? WHERE order_id = ?", [
       partners[Math.floor(Math.random() * partners.length)],
-      now.toISOString(),
+      dispatchedAt,
       addMinutes(now, eta).toISOString(),
       o.id,
     ]);
+    // The notification never carries the code: notifications are stored rows.
     c.notify.send(o.placed_by, {
       kind: 'order',
       title: `Out for delivery — arriving in ${eta} min`,
-      body: `Share OTP ${otp} with the delivery partner only at your door.`,
+      body: 'Open your order to see the delivery code. Share it only with the delivery partner at your door.',
       link: `#/order/${o.id}`,
       channels: ['push', 'sms'],
     });
@@ -342,12 +368,14 @@ function register(r, c) {
         otp_attempts: d.otp_attempts,
       };
     }
-    // The patient sees their delivery OTP in-app (and by SMS); it is stored
-    // only as a hash for verification. Never exposed to provider endpoints.
-    if (!forPatient || !['dispatched', 'arrived'].includes(o.status)) o.otp_plain = undefined;
-    o.otp = o.otp_plain;
-    delete o.otp_plain;
+    // The patient sees the delivery code in-app while the delivery is live
+    // (derived on demand, never stored). Provider views never get it.
     delete o.otp_hash;
+    o.otp = undefined;
+    if (forPatient && d && d.dispatched_at && ['dispatched', 'arrived'].includes(o.status)) {
+      const ageMin = (c.now() - new Date(d.dispatched_at)) / 60000;
+      if (ageMin <= HANDOVER_TTL_MIN) o.otp = handoverCode(c, o.id, d.dispatched_at);
+    }
     o.steps = [
       { key: 'placed', label: 'Order placed · payment held safely' },
       { key: 'verified', label: 'Prescription verified by pharmacist' },

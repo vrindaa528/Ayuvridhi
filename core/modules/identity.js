@@ -1,7 +1,9 @@
 'use strict';
 // identity: phone OTP login, profile, notification feed, home dashboard.
 
-const { must, ageFrom } = require('../util');
+const { must, ageFrom, safeEqual, validate } = require('../util');
+
+const STAFF_ROLES = ['doctor', 'pharmacy', 'lab', 'rider', 'clinic_staff', 'ops'];
 
 function publicUser(c, u) {
   if (!u) return null;
@@ -18,6 +20,7 @@ function publicUser(c, u) {
     language: u.language,
     lat: u.lat,
     lng: u.lng,
+    role: u.role || 'patient',
   };
 }
 
@@ -37,15 +40,21 @@ function crypto6() {
 
 function register(r, c) {
   const { db } = c;
+  const otpHash = (phone, code) => c.keyed(`otp|${phone}|${code}`);
 
   // OTP modes (deps.otpMode):
-  //   null       → no SMS provider: code is logged to the console (demo: fixed code)
+  //   null       → no SMS provider: code is printed to the server console (demo: fixed code)
   //   'sms'      → we generate the code; the host sends it (MSG91)
   //   'external' → the provider generates and checks the code (Twilio Verify);
   //                the host handles /verify for these numbers before core sees it
   // Demo family numbers (98765 000xx) always use the fixed demo code and never
   // trigger a real SMS, so nobody's real phone gets texted by the demo.
-  r.post('/api/auth/otp/request', { auth: false }, ({ body }) => {
+  // The plaintext code only leaves core through out.secret (for the host to
+  // send); it is never written to the database.
+  r.post('/api/auth/otp/request', { auth: false, rate: [
+    { by: 'ip', name: 'otp-request', limit: 20, windowMs: 10 * 60000 },
+    { by: 'phone', name: 'otp-request', limit: 5, windowMs: 10 * 60000, message: 'Too many OTP requests for this number. Try again in 10 minutes.' },
+  ] }, ({ body }) => {
     const phone = String(body.phone || '').replace(/\D/g, '').slice(-10);
     must(/^[6-9]\d{9}$/.test(phone), 400, 'Enter a valid 10-digit Indian mobile number');
     const now = c.now();
@@ -58,31 +67,39 @@ function register(r, c) {
     const demoNumber = isDemoPhone(phone);
     const mode = c.deps.otpMode || null;
     const fixed = c.deps.demoOtp && (!mode || demoNumber);
-    const code = fixed ? c.deps.demoOtp : mode === 'external' ? 'EXTERNAL' : String(crypto6());
-    db.run('INSERT OR REPLACE INTO otps (phone, code, expires_at, attempts) VALUES (?, ?, ?, 0)', [
+    const external = mode === 'external';
+    const code = fixed ? c.deps.demoOtp : external ? 'EXTERNAL' : String(crypto6());
+    db.run('INSERT OR REPLACE INTO otps (phone, code_hash, mode, expires_at, attempts) VALUES (?, ?, ?, ?, 0)', [
       phone,
-      code,
+      external ? null : otpHash(phone, code),
+      external ? 'external' : 'code',
       c.util.addMinutes(now, 15).toISOString(),
     ]);
     if (!mode || fixed) c.log('sms', `OTP for ${phone}: ${code} (not sent — no SMS provider${demoNumber ? ' for demo numbers' : ''})`);
     const user = db.get('SELECT id FROM users WHERE phone = ?', [phone]);
-    return {
+    const out = {
       sent: true,
       channel: mode && !fixed ? 'sms' : 'demo',
       is_new_user: !user,
       demo_code: fixed ? c.deps.demoOtp : undefined,
       resend_after_sec: 30,
     };
+    // Only the host sees this, to send it by SMS. Not part of the response body.
+    const secret = mode && !fixed && !external ? { phone, code } : null;
+    return { __secret: secret, __body: out };
   });
 
-  r.post('/api/auth/otp/verify', { auth: false }, ({ body }) => {
+  r.post('/api/auth/otp/verify', { auth: false, rate: [
+    { by: 'ip', name: 'otp-verify', limit: 30, windowMs: 10 * 60000 },
+    { by: 'phone', name: 'otp-verify', limit: 10, windowMs: 15 * 60000, message: 'Too many attempts for this number. Try again in 15 minutes.' },
+  ] }, ({ body }) => {
     const phone = String(body.phone || '').replace(/\D/g, '').slice(-10);
     const row = db.get('SELECT * FROM otps WHERE phone = ?', [phone]);
     must(row, 400, 'Request an OTP first');
     must(row.expires_at > c.now().toISOString(), 400, 'OTP expired. Request a new one.');
     must(row.attempts < 5, 429, 'Too many wrong attempts. Try again in 15 minutes.');
-    must(row.code !== 'EXTERNAL', 503, 'OTP service unavailable. Try again.');
-    if (String(body.code) !== row.code) {
+    must(row.mode !== 'external', 503, 'OTP service unavailable. Try again.');
+    if (!safeEqual(otpHash(phone, String(body.code || '')), row.code_hash)) {
       db.run('UPDATE otps SET attempts = attempts + 1 WHERE phone = ?', [phone]);
       must(false, 400, 'Incorrect OTP');
     }
@@ -95,6 +112,7 @@ function register(r, c) {
   function checkName(phone, name) {
     if (db.get('SELECT id FROM users WHERE phone = ?', [phone])) return;
     must(name && String(name).trim().length > 1, 400, 'Tell us your name to create the account');
+    must(String(name).length <= 80, 400, 'Name is too long');
   }
 
   function issueSession(phone, name) {
@@ -102,7 +120,7 @@ function register(r, c) {
     if (!user) {
       checkName(phone, name);
       const id = c.util.id('usr');
-      db.run('INSERT INTO users (id, phone, name, language, city, lat, lng, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', [
+      db.run('INSERT INTO users (id, phone, name, language, city, lat, lng, role, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [
         id,
         phone,
         String(name).trim(),
@@ -110,6 +128,7 @@ function register(r, c) {
         'Mumbai',
         19.076,
         72.8777,
+        'patient',
         c.now().toISOString(),
       ]);
       db.run('INSERT INTO emergency_cards (patient_id, allergies, conditions, medicines, contacts, updated_at) VALUES (?, ?, ?, ?, ?, ?)', [
@@ -128,14 +147,34 @@ function register(r, c) {
   }
   c._identity = { issueSession, checkName };
 
+  // DEMO ONLY: a one-click sign-in for each seeded staff role, so the demo's
+  // Partner console can play a doctor, pharmacy, lab, rider, clinic or ops
+  // user. Refused whenever DEMO_MODE is off.
+  r.post('/api/demo/partner-token', { auth: false }, ({ body }) => {
+    must(c.deps.demoMode, 403, 'Demo sign-in is only available in demo mode');
+    must(STAFF_ROLES.includes(body.role), 400, 'Unknown role');
+    const user = db.get("SELECT * FROM users WHERE role = ? AND phone LIKE '98765000%' ORDER BY phone LIMIT 1", [body.role]);
+    must(user, 404, 'No demo account for that role');
+    return { token: c.deps.sign({ sub: user.id, iat: Date.now() }), user: publicUser(c, user) };
+  });
+
   r.get('/api/me', ({ user }) => {
     const fam = c.consent.familyOf(user.id);
     const role = fam ? db.get('SELECT role FROM family_members WHERE family_id = ? AND user_id = ?', [fam.id, user.id]) : null;
     const unread = db.get('SELECT COUNT(*) AS n FROM notifications WHERE user_id = ? AND is_read = 0', [user.id]).n;
-    return { user: publicUser(c, user), family: fam ? { id: fam.id, name: fam.name, role: role && role.role } : null, unread };
+    return { user: publicUser(c, user), family: fam ? { id: fam.id, name: fam.name, role: role && role.role } : null, unread, providers: c.access.providerIds(user) };
   });
 
   r.put('/api/me', ({ user, body }) => {
+    validate(body, {
+      name: { max: 80 },
+      dob: { max: 10, pattern: /^\d{4}-\d{2}-\d{2}$/, message: 'dob must be YYYY-MM-DD' },
+      sex: { max: 1, enum: ['M', 'F', 'O'] },
+      blood_group: { max: 4 },
+      language: { max: 5 },
+      city: { max: 60 },
+      abha_id: { max: 40 },
+    });
     const fields = ['name', 'dob', 'sex', 'blood_group', 'language', 'city', 'abha_id'];
     for (const f of fields) {
       if (body[f] !== undefined) db.run(`UPDATE users SET ${f} = ? WHERE id = ?`, [body[f], user.id]);
@@ -194,4 +233,4 @@ function api(c) {
   };
 }
 
-module.exports = { register, api, publicUser, isDemoPhone };
+module.exports = { register, api, publicUser, isDemoPhone, STAFF_ROLES };

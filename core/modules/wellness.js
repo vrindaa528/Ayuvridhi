@@ -5,16 +5,120 @@
 
 const { must, json, localDay, addMinutes, ageFrom, seasonFor } = require('../util');
 
+// Red-flag rules. Each rule is a list of patterns (word-boundary matched, so
+// "fits" does not match "benefits"). A match counts only if it is not negated
+// ("no chest pain", "denies chest pain") within the same clause. Escalate when
+// in doubt: if any non-negated match is found, the first rule that hits wins.
+// Unit-tested in tests/wellness.test.js. Clinical review is still required
+// (see docs/DECISIONS.md) before this is treated as validated triage.
 const RED_FLAGS = [
-  { words: ['chest pain', 'chest tightness', 'heart attack'], route: 'sos', why: 'Chest pain can be a heart emergency.' },
-  { words: ['breathless', 'can\'t breathe', 'cannot breathe', 'difficulty breathing', 'shortness of breath'], route: 'sos', why: 'Breathing difficulty needs urgent care.' },
-  { words: ['unconscious', 'fainted', 'not responding', 'seizure', 'fits'], route: 'sos', why: 'Loss of consciousness or a seizure is an emergency.' },
-  { words: ['face drooping', 'slurred speech', 'one side weak', 'stroke'], route: 'sos', why: 'These are stroke warning signs — every minute matters.' },
-  { words: ['heavy bleeding', 'vomiting blood', 'blood in vomit', 'black stool'], route: 'sos', why: 'Heavy or internal bleeding needs emergency care.' },
-  { words: ['high fever', 'fever for 3 days', 'fever 3 days', 'fever since 3'], route: 'doctor', why: 'Fever lasting 3+ days should be seen by a doctor.' },
-  { words: ['blood in urine', 'severe headache', 'severe pain', 'pregnan', 'child not eating', 'dehydrat'], route: 'doctor', why: 'This needs a doctor’s assessment, not a home remedy.' },
-  { words: ['sugar very high', 'sugar very low', 'sugar 300', 'sugar 50', 'hypo'], route: 'doctor', why: 'Very high or low blood sugar needs medical advice today.' },
+  {
+    route: 'sos',
+    why: 'Chest pain can be a heart emergency.',
+    patterns: [/\bchest\s+(pain|pressure|tightness|discomfort)\b/i, /\bheart\s+attack\b/i, /\bseene\s+(mein|me)\s+(dard|dabav)\b/i],
+  },
+  {
+    route: 'sos',
+    why: 'Breathing difficulty needs urgent care.',
+    patterns: [/\bbreathless(ness)?\b/i, /\bcan['’]?t\s+breathe\b/i, /\bcannot\s+breathe\b/i, /\bdifficulty\s+(in\s+)?breathing\b/i, /\bshortness\s+of\s+breath\b/i, /\bsaans\s+(phool|phul|ruk)\w*/i],
+  },
+  {
+    route: 'sos',
+    why: 'Loss of consciousness or a seizure is an emergency.',
+    patterns: [
+      /\bunconscious\b/i,
+      /\bfainted\b/i,
+      /\bpassed\s+out\b/i,
+      /\bseizures?\b/i,
+      /\bconvulsions?\b/i,
+      /\bbehosh\b/i,
+      /\bmirgi\b/i,
+      /\b(had|has|have|having|got|getting|gets|get|suffering\s+from|experiencing)\s+(\w+\s+){0,2}fits\b/i,
+      /\b(his|her|my|their|patient['’]?s|dad['’]?s|mom['’]?s|papa['’]?s|maa['’]?s)\s+fits\b/i,
+      /\bfits\s+(are\s+)?(coming|again|back|happening|aa\s+rahe|aa\s+rahi|aaye)\b/i,
+      /\b(he|she|they|dad|mom|mother|father|papa|maa|dadi|nani|nana|grandma|grandpa|patient)\b[^.,;!?]*\bnot\s+responding\b/i,
+    ],
+  },
+  {
+    route: 'sos',
+    why: 'These are stroke warning signs — every minute matters.',
+    patterns: [/\bface\s+(is\s+)?drooping\b/i, /\bslurred\s+speech\b/i, /\bone\s+side\s+(is\s+)?weak\b/i, /\bstroke\b/i],
+  },
+  {
+    route: 'sos',
+    why: 'Heavy or internal bleeding needs emergency care.',
+    patterns: [/\bheavy\s+bleeding\b/i, /\bvomiting\s+blood\b/i, /\bblood\s+in\s+(the\s+)?vomit\b/i, /\bblack\s+stool\b/i, /\bkhoon\s+ki\s+ulti\b/i],
+  },
+  {
+    route: 'doctor',
+    why: 'Fever lasting 3+ days should be seen by a doctor.',
+    patterns: [/\bhigh\s+fever\b/i, /\bfever\s+(for|since)\s+(3|4|5|6|7|8|9|\d{2,})\s+days?\b/i, /\bfever\s+(3|4|5|6|7|8|9|\d{2,})\s+days?\b/i],
+  },
+  {
+    route: 'doctor',
+    why: 'This needs a doctor’s assessment, not a home remedy.',
+    patterns: [
+      /\bblood\s+in\s+urine\b/i,
+      /\bsevere\s+headache\b/i,
+      /\bsevere\s+pain\b/i,
+      /\bpregnan(cy|t)\b/i,
+      /\bchild\s+(is\s+)?not\s+eating\b/i,
+      /\bdehydrat\w*/i,
+    ],
+  },
+  {
+    route: 'doctor',
+    why: 'Very high or low blood sugar needs medical advice today.',
+    patterns: [
+      /\bsugar\s+(is\s+)?(very\s+)?(high|low)\b/i,
+      /\bsugar\s+(300|50)\b/i,
+      /\bhypoglyc\w*/i,
+      /\bhypo\b/i,
+      /\bhyperglyc\w*/i,
+    ],
+  },
 ];
+
+// Negation words that cancel a match when they appear in the same clause
+// before it. Clause boundaries are punctuation and "but"/"lekin".
+const NEGATION = /\b(no|not|without|never|denies|deny|denied|don['’]?t|doesn['’]?t|didn['’]?t|isn['’]?t|nahi|nahin|bina)\b/i;
+function negatedBefore(text, index) {
+  const window = text.slice(Math.max(0, index - 60), index);
+  const cut = window.split(/[.,;:!?\n]|\s(but|lekin|however)\s/i).pop();
+  return NEGATION.test(cut);
+}
+
+// Hinglish/English trailing negation: "chest pain nahi hai". Only the words
+// right after the match count, so "chest pain, not sure" still escalates.
+const TRAILING_NEGATION = /^\s+(hai\s+|hain\s+)?(nahi|nahin|nhi|not)\b/i;
+function negatedAfter(text, index, length) {
+  return TRAILING_NEGATION.test(text.slice(index + length, index + length + 20));
+}
+
+// Returns the escalation for a text, or null. Pure function, no database.
+function redFlagFor(text) {
+  const t = String(text || '').replace(/[’‘]/g, "'").toLowerCase();
+  for (const rule of RED_FLAGS) {
+    for (const re of rule.patterns) {
+      const global = new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g');
+      let m;
+      while ((m = global.exec(t)) !== null) {
+        if (!negatedBefore(t, m.index) && !negatedAfter(t, m.index, m[0].length)) {
+          return { route: rule.route, message: rule.why, cta: rule.route === 'sos' ? 'Call 112 / Start SOS' : 'Consult a doctor now', matched: m[0] };
+        }
+        if (m[0].length === 0) break;
+      }
+    }
+  }
+  return null;
+}
+
+// Whole-word test used for remedy filters (no substring surprises).
+function wholeWord(text, word) {
+  const w = String(word || '').trim().toLowerCase();
+  if (!w) return false;
+  return new RegExp(`\\b${w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(String(text || ''));
+}
 
 function register(r, c) {
   const { db } = c;
@@ -68,7 +172,7 @@ function register(r, c) {
     const hidden = [];
     for (const r0 of rows) {
       const avoid = json(r0.avoid_if, []);
-      const clash = avoid.find((a) => personal.some((p) => p.includes(a.toLowerCase())));
+      const clash = avoid.find((a) => personal.some((p) => wholeWord(p, a)));
       const item = Object.assign({}, r0, { seasons: json(r0.seasons, []), ingredients: json(r0.ingredients, []), avoid_if: avoid });
       if (clash) hidden.push({ id: r0.id, title: r0.title, reason: `Not suggested with ${clash}` });
       else shown.push(Object.assign(item, { in_season: item.seasons.includes(season) || item.seasons.includes('all') }));
@@ -86,14 +190,11 @@ function register(r, c) {
   r.post('/api/remedies/check', ({ body }) => {
     const text = String(body.text || '').toLowerCase();
     must(text.trim().length > 1, 400, 'Describe how you feel');
-    for (const f of RED_FLAGS) {
-      if (f.words.some((w) => text.includes(w))) {
-        return { route: f.route, message: f.why, cta: f.route === 'sos' ? 'Call 112 / Start SOS' : 'Consult a doctor now' };
-      }
-    }
+    const flag = redFlagFor(text);
+    if (flag) return { route: flag.route, message: flag.message, cta: flag.cta };
     const rows = db.all('SELECT id, title, hindi, goal FROM remedies', []);
     const words = text.split(/\W+/).filter((w) => w.length > 3);
-    const matches = rows.filter((r0) => words.some((w) => (r0.goal + ' ' + r0.title).toLowerCase().includes(w)));
+    const matches = rows.filter((r0) => words.some((w) => wholeWord(r0.goal + ' ' + r0.title, w)));
     return {
       route: 'remedies',
       message: matches.length ? 'These traditional practices may help with comfort. See a doctor if it does not improve in 2–3 days.' : 'No matching remedy. If you are unwell, a doctor consult is the safest next step.',
@@ -135,4 +236,4 @@ function api(c) {
   };
 }
 
-module.exports = { register, api, RED_FLAGS };
+module.exports = { register, api, redFlagFor, RED_FLAGS };

@@ -1,6 +1,6 @@
 'use strict';
 // trust (ops console): provider onboarding and verification, expiry tracking,
-// platform metrics. In production these routes require an ops role.
+// platform metrics. Every route here requires users.role = 'ops'.
 
 const { must, json, addMinutes, localDay } = require('../util');
 
@@ -16,7 +16,7 @@ const REG_RULES = {
 function register(r, c) {
   const { db } = c;
 
-  r.get('/api/admin/providers', ({ query }) => {
+  r.get('/api/admin/providers', { roles: ['ops'] }, ({ query }) => {
     const status = query.status || 'pending';
     const rows = db.all('SELECT * FROM providers WHERE verified_status = ? ORDER BY name', [status]);
     const soon = localDay(addMinutes(c.now(), 60 * 1440));
@@ -28,7 +28,7 @@ function register(r, c) {
     };
   });
 
-  r.post('/api/admin/providers', ({ body }) => {
+  r.post('/api/admin/providers', { roles: ['ops'] }, ({ user, body, ip }) => {
     must(REG_RULES[body.type], 400, 'Unknown provider type');
     must(body.name && body.reg_no, 400, 'Name and registration number are required');
     const id = c.util.id('prv');
@@ -36,10 +36,11 @@ function register(r, c) {
       'INSERT INTO providers (id, type, name, specialty, qualification, reg_no, lat, lng, address, fee, languages, rating, verified_status, services, is_open, availability_updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       [id, body.type, body.name, body.specialty || null, body.qualification || null, String(body.reg_no).toUpperCase(), 19.07 + Math.random() * 0.05, 72.84 + Math.random() * 0.05, body.address || 'Mumbai', body.fee || 0, '["English","Hindi"]', 0, 'pending', '[]', 1, c.now().toISOString()]
     );
+    c.audit(user, 'provider.create', null, ip, `${body.type} ${id}`);
     return { id };
   });
 
-  r.post('/api/admin/providers/:id/verify', ({ params, body }) => {
+  r.post('/api/admin/providers/:id/verify', { roles: ['ops'] }, ({ user, params, body, ip }) => {
     const p = db.get('SELECT * FROM providers WHERE id = ?', [params.id]);
     must(p, 404, 'Provider not found');
     const rule = REG_RULES[p.type];
@@ -58,17 +59,58 @@ function register(r, c) {
       now,
       p.id,
     ]);
+    c.audit(user, ok ? 'provider.verify' : 'provider.reject', null, ip, `${p.id}: ${checks.map((k) => k.check_name + '=' + k.result).join('; ')}`);
     c.events.emit(ok ? 'provider.verified' : 'provider.rejected', { provider_id: p.id });
     return { status: ok ? 'verified' : 'rejected', checks };
   });
 
-  r.post('/api/admin/providers/:id/suspend', ({ params, body }) => {
+  r.post('/api/admin/providers/:id/suspend', { roles: ['ops'] }, ({ user, params, body, ip }) => {
+    must(db.get('SELECT id FROM providers WHERE id = ?', [params.id]), 404, 'Provider not found');
     db.run("UPDATE providers SET verified_status = 'suspended' WHERE id = ?", [params.id]);
     db.run('INSERT INTO verifications (provider_id, check_name, result, at) VALUES (?, ?, ?, ?)', [params.id, `Suspended: ${body.reason || 'complaint review'}`, 'fail', c.now().toISOString()]);
+    c.audit(user, 'provider.suspend', null, ip, `${params.id}: ${body.reason || 'complaint review'}`);
+  });
+
+  // Ops links a staff login to a provider record. The role must fit the record:
+  // a rider is linked to the pharmacy it delivers for.
+  const ACCOUNT_ROLE_FITS = {
+    doctor: ['doctor'],
+    lab: ['lab'],
+    pharmacy: ['pharmacy'],
+    rider: ['pharmacy'],
+    clinic_staff: ['clinic', 'hospital'],
+  };
+  r.post('/api/admin/provider-accounts', { roles: ['ops'] }, ({ user, body, ip }) => {
+    must(ACCOUNT_ROLE_FITS[body.role], 400, 'Unknown staff role');
+    const phone = String(body.phone || '').replace(/\D/g, '').slice(-10);
+    must(/^[6-9]\d{9}$/.test(phone), 400, 'Enter a valid 10-digit mobile number');
+    const p = db.get('SELECT * FROM providers WHERE id = ?', [body.provider_id]);
+    must(p, 404, 'Provider not found');
+    must(ACCOUNT_ROLE_FITS[body.role].includes(p.type), 400, `A ${body.role} login cannot be linked to a ${p.type}`);
+    let target = db.get('SELECT * FROM users WHERE phone = ?', [phone]);
+    if (!target) {
+      const uid = c.util.id('usr');
+      db.run('INSERT INTO users (id, phone, name, language, city, lat, lng, role, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [uid, phone, String(body.name || `${p.name} (${body.role})`).slice(0, 80), 'en', 'Mumbai', 19.076, 72.8777, body.role, c.now().toISOString()]);
+      target = db.get('SELECT * FROM users WHERE id = ?', [uid]);
+    }
+    must(target.role === 'patient' || target.role === body.role, 400, 'That number already belongs to a different staff role');
+    db.run('INSERT OR REPLACE INTO provider_accounts (user_id, provider_id, role, created_at) VALUES (?, ?, ?, ?)', [target.id, p.id, body.role, c.now().toISOString()]);
+    db.run('UPDATE users SET role = ? WHERE id = ?', [body.role, target.id]);
+    c.audit(user, 'account.link', target.id, ip, `${body.role} for ${p.id}`);
+    return { user_id: target.id, provider_id: p.id, role: body.role };
+  });
+
+  r.post('/api/admin/provider-accounts/revoke', { roles: ['ops'] }, ({ user, body, ip }) => {
+    const row = db.get('SELECT * FROM provider_accounts WHERE user_id = ? AND provider_id = ?', [body.user_id, body.provider_id]);
+    must(row, 404, 'No such staff link');
+    db.run('DELETE FROM provider_accounts WHERE user_id = ? AND provider_id = ?', [body.user_id, body.provider_id]);
+    const left = db.get('SELECT COUNT(*) AS n FROM provider_accounts WHERE user_id = ?', [body.user_id]).n;
+    if (!left) db.run("UPDATE users SET role = 'patient' WHERE id = ?", [body.user_id]);
+    c.audit(user, 'account.revoke', body.user_id, ip, `${row.role} for ${row.provider_id}`);
   });
 
   // Platform metrics for the ops dashboard / investor demo.
-  r.get('/api/admin/metrics', () => {
+  r.get('/api/admin/metrics', { roles: ['ops'] }, () => {
     const n = (sql, a) => db.get(sql, a || []).n;
     const since = addMinutes(c.now(), -7 * 1440).toISOString();
     const taken = n("SELECT COUNT(*) AS n FROM dose_events WHERE status = 'taken' AND due_at >= ?", [since]);

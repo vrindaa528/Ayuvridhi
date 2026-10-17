@@ -12,7 +12,8 @@ function register(r, c) {
     db.run('INSERT INTO sos_steps (sos_id, step, detail, at) VALUES (?, ?, ?, ?)', [sosId, key, detail, c.now().toISOString()]);
   }
 
-  r.post('/api/sos', ({ user, body }) => {
+  // Rate limit stops a stuck button or an abusive client from flooding caregivers.
+  r.post('/api/sos', { rate: [{ by: 'user', name: 'sos-create', limit: 5, windowMs: 10 * 60000, message: 'Too many SOS requests. If this is a real emergency, call 112.' }] }, ({ user, body }) => {
     const patientId = body.member_id || user.id;
     if (patientId !== user.id) must(c.consent.can(user.id, patientId, 'location') || c.consent.isGuardian(user.id, patientId), 403, 'No consent to raise SOS for this member');
     const existing = db.get("SELECT id FROM sos_events WHERE patient_id = ? AND status = 'active'", [patientId]);

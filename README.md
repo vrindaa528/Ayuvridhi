@@ -8,7 +8,7 @@ Requires **Node.js 22.5 or newer** (uses the built-in `node:sqlite`). No `npm in
 
 ```bash
 npm start            # http://localhost:3000
-npm test             # 15 end-to-end tests (flows + SMS OTP login)
+npm test             # 84 tests: flows, SMS OTP login, security/roles, red flags, server boot
 ```
 
 The first start creates `data/aayuvridhi.db` and seeds a demo family. Delete the `data/` folder (or use Profile → Reset demo data) to start fresh.
@@ -23,6 +23,23 @@ The first start creates `data/aayuvridhi.db` and seeds a demo family. Delete the
 | 98765 00004 | Ramesh Kumar — hypertension |
 
 Any other 10-digit number creates a new account.
+
+**Demo staff logins** (demo mode only, OTP `123456`). Each one can act only for the provider record it is linked to. The Partner console switches between them with the role buttons.
+
+| Phone | Role | Acts for |
+| --- | --- | --- |
+| 98765 00051 | doctor | Dr. Priya Sharma (cardiology) |
+| 98765 00052 | doctor | Dr. Anil Mehta (general physician) |
+| 98765 00061 | pharmacy | Sanjeevani Pharmacy |
+| 98765 00062 | pharmacy | HealthFirst Chemist |
+| 98765 00063 | pharmacy | Apna Medical Store |
+| 98765 00071 | lab | Pathcare Diagnostics |
+| 98765 00072 | lab | Precision Labs |
+| 98765 00081 | rider | delivers for Sanjeevani Pharmacy |
+| 98765 00091 | clinic_staff | Metro Hospital desk |
+| 98765 00099 | ops | Trust & operations (admin routes) |
+
+Outside demo mode these numbers are ordinary accounts with no staff access. Ops links real staff to provider records with `POST /api/admin/provider-accounts` (role must fit the provider type).
 
 ### Real OTP on your phone
 
@@ -44,9 +61,10 @@ For production in India, use `SMS_PROVIDER=msg91` with a DLT-registered OTP temp
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `PORT` | `3000` | HTTP port |
-| `DEMO_MODE` | `1` | `0` = random OTPs, no autopilot for clinics/pharmacies, no demo reset |
+| `DEMO_MODE` | `1` | `0` = random OTPs, no autopilot, no demo reset, no demo staff sign-in |
 | `DB_PATH` | `data/aayuvridhi.db` | SQLite file |
-| `JWT_SECRET` | demo secret | **Set this in any shared deployment** |
+| `JWT_SECRET` | demo secret | **Required when `DEMO_MODE=0`** (at least 32 random characters). The server refuses to start without it. Also seeds the keyed hash used for OTPs and delivery codes. |
+| `TRUST_PROXY` | `0` | `1` = take the client IP from `X-Forwarded-For` (only behind a proxy you control). Rate limits use the IP. |
 | `TZ` | `Asia/Kolkata` | Timezone for dose schedules |
 | `SMS_PROVIDER` | empty | `twilio` or `msg91` to send real OTP SMS (see above) |
 
@@ -114,8 +132,42 @@ npm run build:prototype      # → dist/aayuvridhi-prototype.html
 
 The prototype runs the same `core/` code in the browser on SQLite compiled to JavaScript and saves each viewer's demo data in IndexedDB.
 
+## Security (Phase 1)
+
+- **Roles on every request.** Users have a role (`patient`, `doctor`, `pharmacy`, `lab`, `rider`, `clinic_staff`, `ops`). The role is read from the database on each call, not trusted from the token, so a revoked staff link stops working immediately.
+- **Ownership.** `provider_accounts` links a staff login to provider records. A doctor can only confirm their own bookings and write prescriptions for them. A pharmacy can only verify and dispatch its own orders. Riders can hand over orders of the pharmacy they are linked to.
+- **Admin is ops-only.** Every `/api/admin/*` route requires `ops`. A test calls every staff route with a patient and anonymous token and checks for 403 and 401.
+- **No plaintext codes.** Login OTPs are stored as keyed hashes (HMAC with a key derived from `JWT_SECRET`). Delivery handover codes are never stored: they are derived on demand, shown only to the patient while the delivery is live (12 hours), and checked against a keyed hash.
+- **Rate limits.** OTP requests (per IP and per number), OTP verification, SOS creation, uploads and share links. Limits return `429` with a retry time.
+- **Validation.** Profile and record bodies are checked for types, lengths and formats.
+- **Red flags.** Symptom routing matches whole words and ignores negated symptoms ("no chest pain"). It still escalates when a real symptom appears alongside a negated one.
+- **Audit log.** Staff actions, handover attempts and refused (403) requests are written to `access_logs` with the actor and IP.
+- **Headers.** The static app is sent with a Content-Security-Policy, `X-Frame-Options: DENY` and a strict Referrer-Policy.
+- **Share links** use 24 random bytes from the platform CSPRNG.
+
+## Feature status
+
+Honest status as of Phase 1. **Real** means working code with no outside service; **Stand-in only** means the real integration exists as a seam but has only been tested against a local fake; **Demo** means simulated behaviour.
+
+| Area | Status |
+| --- | --- |
+| Login by OTP (SMS via Twilio Verify or MSG91) | Real (SMS tested against stand-in servers; not tested with real keys) |
+| Roles, staff links, ownership on provider and admin routes | Real |
+| Delivery handover code, keyed hashes, rate limits, audit log | Real |
+| Medicine reminders, family mode, consent, records, timeline | Real logic; reminders go to in-app feed only |
+| Red-flag symptom routing | Real rules, pattern-based; **not clinically validated** |
+| Payments, escrow, refunds | Demo (ledger only, no gateway) |
+| SMS/push/WhatsApp for reminders and SOS | Demo (logged, not sent) |
+| Video consults | Demo (no video provider) |
+| Maps, ETA, rider GPS | Demo (straight-line simulation) |
+| Record file storage and OCR | Demo (file name only) |
+| ABHA/ABDM, registry checks | Demo (format check only, labelled as such in the code) |
+| Provider apps (doctor, pharmacy, lab, rider, ops) | Demo console only; separate apps not built |
+
+Phases 2 to 6 of the platform plan (new modules, real adapters, consoles, Postgres, CI) are not started. See `docs/IMPLEMENTATION_PLAN.md`.
+
 ## Path to production
 
 See the Technical Architecture doc. In short: React Native app on the same API; NestJS + PostgreSQL (the schema ports directly) + Redis/BullMQ for the scheduler; Razorpay Route for escrow; MSG91 + FCM for notifications; 100ms/Agora for video; ABDM sandbox → certification for ABHA and record exchange; AWS ap-south-1 for data residency.
 
-**Not production-ready as is:** demo OTP and JWT secret defaults (real SMS OTP is available — see above), provider/ops routes are open to any logged-in user (they need role checks), payments/SMS/video are simulated, and uploaded files keep only their name (no object storage yet).
+**Not production-ready as is.** Phase 1 closed the access-control and secrets gaps: the server now refuses to start without `JWT_SECRET`, and staff routes are role- and owner-checked. Still open: payments, notifications, video, maps and storage are simulated (see the status table), there is no separate staff app or login UI outside the demo console, the rate limiter is in memory (one instance only), and nothing has been penetration-tested. Remedy and red-flag content needs review by a BAMS/MD doctor, and compliance notes need review by a lawyer, before real patients use it.

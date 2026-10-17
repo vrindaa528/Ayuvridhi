@@ -25,7 +25,20 @@ const { isDemoPhone } = require('../core/modules/identity');
 const PORT = Number(process.env.PORT) || 3000;
 const DEMO = process.env.DEMO_MODE !== '0';
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, '..', 'data', 'aayuvridhi.db');
-const SECRET = process.env.JWT_SECRET || (DEMO ? 'demo-secret-change-me' : crypto.randomBytes(32).toString('hex'));
+const TRUST_PROXY = process.env.TRUST_PROXY === '1';
+
+// Outside demo mode the server must have its own secret. It refuses to boot
+// rather than silently signing tokens with a known or random key.
+const DEMO_SECRET = 'demo-secret-change-me';
+const SECRET = process.env.JWT_SECRET || (DEMO ? DEMO_SECRET : '');
+if (!DEMO && (!SECRET || SECRET === DEMO_SECRET || SECRET.length < 32)) {
+  console.error('Refusing to start: set JWT_SECRET to a random string of at least 32 characters (or DEMO_MODE=1 for the demo).');
+  process.exit(1);
+}
+// Keyed hash for OTP and handover codes. Derived from the JWT secret, so a
+// database leak alone does not reveal any code.
+const KEYED = crypto.createHmac('sha256', SECRET).update('aayuvridhi:keyed-hash:v1').digest();
+const keyedHmac = (message) => crypto.createHmac('sha256', KEYED).update(message).digest('hex');
 const PUBLIC = path.join(__dirname, '..', 'public');
 const TOKEN_TTL_MS = 7 * 24 * 3600 * 1000;
 
@@ -49,7 +62,6 @@ function verify(token) {
     return null;
   }
 }
-const hash = (s) => crypto.createHash('sha256').update(`otp:${s}`).digest('hex');
 
 let core;
 let timer;
@@ -61,7 +73,8 @@ function boot(fresh) {
     db: openDb(DB_PATH),
     sign,
     verify,
-    hash,
+    hmac: keyedHmac,
+    demoMode: DEMO,
     demoOtp: DEMO ? '123456' : null,
     otpMode: sms ? sms.mode : null,
     autoConfirmSeconds: DEMO ? 8 : 0,
@@ -79,20 +92,22 @@ clearInterval(timer);
 timer = setInterval(() => core.tick(), 5000);
 
 // ---- real SMS OTP ----
-async function deliverOtp(phone) {
-  const row = core.c.db.get('SELECT code FROM otps WHERE phone = ?', [phone]);
-  if (!row) throw new Error('no OTP row');
+async function deliverOtp(phone, code) {
   if (sms.mode === 'external') return sms.start(phone);
-  return sms.send(phone, row.code);
+  if (!code) throw new Error('no OTP code to send');
+  return sms.send(phone, code);
 }
 
 // Twilio Verify checks the code itself, so verification happens here
 // (async) and core only issues the session once Twilio approves.
-async function verifyExternal(body) {
+async function verifyExternal(body, ip) {
   const phone = String(body.phone || '').replace(/\D/g, '').slice(-10);
   const db = core.c.db;
+  const gate = core.c.limiter.take(`otp-verify-external|phone:${phone}`, 10, 15 * 60000);
+  if (!gate.ok) return { status: 429, body: { error: 'Too many attempts for this number. Try again in 15 minutes.', retry_after_sec: gate.retry_after_sec } };
+  if (!core.c.limiter.take(`otp-verify-external|ip:${ip}`, 30, 10 * 60000).ok) return { status: 429, body: { error: 'Too many requests. Please wait and try again.' } };
   const row = db.get('SELECT * FROM otps WHERE phone = ?', [phone]);
-  if (!row || row.code !== 'EXTERNAL') return null; // demo numbers / other modes: core handles it
+  if (!row || row.mode !== 'external') return null; // demo numbers / other modes: core handles it
   if (row.expires_at <= new Date().toISOString()) return { status: 400, body: { error: 'OTP expired. Request a new one.' } };
   if (row.attempts >= 5) return { status: 429, body: { error: 'Too many wrong attempts. Try again in 15 minutes.' } };
   try {
@@ -121,6 +136,35 @@ async function verifyExternal(body) {
   }
 }
 
+// Security headers for the static app. style-src allows inline styles because
+// the screens set style="" attributes; scripts are same-origin files only.
+const CSP = [
+  "default-src 'self'",
+  "script-src 'self'",
+  "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+  "font-src 'self' https://fonts.gstatic.com",
+  "img-src 'self' data:",
+  "connect-src 'self'",
+  "frame-ancestors 'none'",
+  "base-uri 'self'",
+  "form-action 'self'",
+  "object-src 'none'",
+].join('; ');
+const SECURITY_HEADERS = {
+  'Content-Security-Policy': CSP,
+  'X-Frame-Options': 'DENY',
+  'Referrer-Policy': 'strict-origin-when-cross-origin',
+  'X-Content-Type-Options': 'nosniff',
+};
+
+// The client IP comes from the socket. X-Forwarded-For is trusted only when
+// TRUST_PROXY=1 (behind a load balancer you control). Any x-client-ip header
+// the client sends is overwritten here.
+function clientIp(req) {
+  if (TRUST_PROXY && req.headers['x-forwarded-for']) return String(req.headers['x-forwarded-for']).split(',')[0].trim();
+  return (req.socket && req.socket.remoteAddress) || 'unknown';
+}
+
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.json': 'application/json', '.ico': 'image/x-icon', '.webmanifest': 'application/manifest+json' };
 
 function send(res, status, body, headers) {
@@ -138,6 +182,7 @@ const server = http.createServer((req, res) => {
       if (raw.length > 2e6) req.destroy();
     });
     req.on('end', async () => {
+      const headers = Object.assign({}, req.headers, { 'x-client-ip': clientIp(req) });
       let body = {};
       if (raw) {
         try {
@@ -154,14 +199,14 @@ const server = http.createServer((req, res) => {
       if (url === '/api/health') return send(res, 200, { ok: true, demo: DEMO, sms: sms ? sms.name : 'none' });
       try {
         if (sms && req.method === 'POST' && url === '/api/auth/otp/verify') {
-          const handled = await verifyExternal(body);
+          const handled = await verifyExternal(body, headers['x-client-ip']);
           if (handled) return send(res, handled.status, handled.body);
         }
-        const out = core.handle(req.method, url, body, req.headers);
+        const out = core.handle(req.method, url, body, headers);
         if (sms && req.method === 'POST' && url === '/api/auth/otp/request' && out.status === 200 && out.body.channel === 'sms') {
           const phone = String(body.phone || '').replace(/\D/g, '').slice(-10);
           try {
-            await deliverOtp(phone);
+            await deliverOtp(phone, out.secret && out.secret.phone === phone ? out.secret.code : null);
             console.log(`[sms:${sms.name}] OTP sent to +91 ${phone.slice(0, 2)}xxxxxx${phone.slice(-2)}`);
           } catch (e) {
             core.c.db.run('DELETE FROM otps WHERE phone = ?', [phone]);
@@ -182,7 +227,7 @@ const server = http.createServer((req, res) => {
   if (!file.startsWith(PUBLIC)) return send(res, 403, 'Forbidden', { 'Content-Type': 'text/plain' });
   if (fs.existsSync(file) && fs.statSync(file).isDirectory()) file = path.join(file, 'index.html');
   if (!fs.existsSync(file)) file = path.join(PUBLIC, 'index.html');
-  res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream', 'Cache-Control': 'no-cache' });
+  res.writeHead(200, Object.assign({ 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream', 'Cache-Control': 'no-cache' }, SECURITY_HEADERS));
   fs.createReadStream(file).pipe(res);
 });
 

@@ -110,6 +110,27 @@ function seed(core) {
     }
   }
 
+  // ---------- staff logins (demo) ----------
+  // Each demo staff user signs in with OTP 123456 (98765 000xx numbers only).
+  // provider_accounts ties a login to one provider record; the Partner
+  // console uses /api/demo/partner-token to act as these users.
+  const staff = [
+    ['usr_staff_priya', '9876500051', 'Dr. Priya Sharma (demo)', 'doctor', 'prv_doc_priya'],
+    ['usr_staff_anil', '9876500052', 'Dr. Anil Mehta (demo)', 'doctor', 'prv_doc_anil'],
+    ['usr_staff_sanjeevani', '9876500061', 'Sanjeevani Pharmacy (demo)', 'pharmacy', 'prv_ph_sanjeevani'],
+    ['usr_staff_healthfirst', '9876500062', 'HealthFirst Chemist (demo)', 'pharmacy', 'prv_ph_healthfirst'],
+    ['usr_staff_apna', '9876500063', 'Apna Medical Store (demo)', 'pharmacy', 'prv_ph_apna'],
+    ['usr_staff_pathcare', '9876500071', 'Pathcare Diagnostics (demo)', 'lab', 'prv_lab_pathcare'],
+    ['usr_staff_precision', '9876500072', 'Precision Labs (demo)', 'lab', 'prv_lab_precision'],
+    ['usr_staff_rider', '9876500081', 'Ravi S., delivery partner (demo)', 'rider', 'prv_ph_sanjeevani'],
+    ['usr_staff_metro', '9876500091', 'Metro Hospital desk (demo)', 'clinic_staff', 'prv_hosp_metro'],
+    ['usr_staff_ops', '9876500099', 'Aayuvridhi Ops (demo)', 'ops', null],
+  ];
+  for (const [uid, phone, name, role, providerId] of staff) {
+    db.run('INSERT INTO users (id, phone, name, language, city, lat, lng, role, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [uid, phone, name, 'en', 'Mumbai', HOME.lat, HOME.lng, role, iso(ago(365))]);
+    if (providerId) db.run('INSERT INTO provider_accounts (user_id, provider_id, role, created_at) VALUES (?, ?, ?, ?)', [uid, providerId, role, iso(ago(365))]);
+  }
+
   // ---------- pharmacy stock ----------
   const DRUGS = require('./modules/pharmacy').DRUGS;
   const stockPlan = {

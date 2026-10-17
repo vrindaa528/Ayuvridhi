@@ -98,7 +98,10 @@ const runtime = `
       db: adapter(raw),
       sign: function (p) { return b64(JSON.stringify(p)); },
       verify: function (t) { try { return JSON.parse(unb64(t)); } catch (e) { return null; } },
-      hash: hash,
+      // Demo only: the in-browser prototype has no secret, so this keyed hash
+      // is for the demo's behaviour, not for security. See docs/DECISIONS.md.
+      hmac: function (m) { return hash('prototype-demo-key|' + m); },
+      demoMode: true,
       demoOtp: '123456',
       autoConfirmSeconds: 8,
       maxDemoEtaMin: 2,

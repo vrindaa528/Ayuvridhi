@@ -108,43 +108,59 @@ function register(r, c) {
 
   // ---- Provider side (clinic / lab app). In production these routes require
   // a provider token; in the demo the Provider Console calls them.
-  r.get('/api/provider/queue', () => {
-    const bookings = db.all(
-      `SELECT b.*, p.name AS provider_name, p.type AS provider_type, u.name AS patient_name, s.start_at
-       FROM bookings b JOIN providers p ON p.id = b.provider_id JOIN users u ON u.id = b.patient_id LEFT JOIN slots s ON s.id = b.slot_id
-       WHERE b.status IN ('requested','confirmed','checked_in','in_consult') ORDER BY b.created_at DESC LIMIT 30`,
-      []
-    );
-    const orders = db.all(
-      `SELECT o.*, p.name AS pharmacy_name, u.name AS patient_name FROM orders o JOIN providers p ON p.id = o.pharmacy_id JOIN users u ON u.id = o.patient_id
-       WHERE o.status IN ('placed','substitution_pending','verified','dispatched','arrived') ORDER BY o.created_at DESC LIMIT 30`,
-      []
-    );
+  // Staff see only what their own provider records are involved in.
+  r.get('/api/provider/queue', { roles: ['doctor', 'lab', 'clinic_staff', 'pharmacy', 'rider'] }, ({ user }) => {
+    const providerIds = c.access.providerIds(user);
+    const ph = (ids) => ids.map(() => '?').join(',') || "''";
+    const bookings = providerIds.length
+      ? db.all(
+          `SELECT b.*, p.name AS provider_name, p.type AS provider_type, u.name AS patient_name, s.start_at
+           FROM bookings b JOIN providers p ON p.id = b.provider_id JOIN users u ON u.id = b.patient_id LEFT JOIN slots s ON s.id = b.slot_id
+           WHERE b.provider_id IN (${ph(providerIds)}) AND b.status IN ('requested','confirmed','checked_in','in_consult') ORDER BY b.created_at DESC LIMIT 30`,
+          providerIds
+        )
+      : [];
+    const orders = providerIds.length
+      ? db.all(
+          `SELECT o.*, p.name AS pharmacy_name, u.name AS patient_name FROM orders o JOIN providers p ON p.id = o.pharmacy_id JOIN users u ON u.id = o.patient_id
+           WHERE o.pharmacy_id IN (${ph(providerIds)}) AND o.status IN ('placed','substitution_pending','verified','dispatched','arrived') ORDER BY o.created_at DESC LIMIT 30`,
+          providerIds
+        )
+      : [];
     return {
       bookings,
-      orders: orders.map((o) => Object.assign(o, { items: json(o.items, []), otp_plain: undefined, otp_hash: undefined })),
+      orders: orders.map((o) => Object.assign(o, { items: json(o.items, []), otp_hash: undefined })),
     };
   });
 
-  r.post('/api/provider/bookings/:id/confirm', ({ params }) => {
-    const b = get(params.id);
+  function ownBooking(user, id) {
+    const b = get(id);
     must(b, 404, 'Booking not found');
+    c.access.assertOwns(user, b.provider_id);
+    return b;
+  }
+
+  r.post('/api/provider/bookings/:id/confirm', { roles: ['doctor', 'lab', 'clinic_staff'] }, ({ user, params, ip }) => {
+    const b = ownBooking(user, params.id);
     must(b.status === 'requested', 400, 'Booking is not awaiting confirmation');
     confirm(b);
+    c.audit(user, 'booking.confirm', b.patient_id, ip, `booking ${b.id}`);
     return get(b.id);
   });
 
-  r.post('/api/provider/bookings/:id/reject', ({ params, body }) => {
-    const b = get(params.id);
-    must(b && b.status === 'requested', 400, 'Booking is not awaiting confirmation');
+  r.post('/api/provider/bookings/:id/reject', { roles: ['doctor', 'lab', 'clinic_staff'] }, ({ user, params, body, ip }) => {
+    const b = ownBooking(user, params.id);
+    must(b.status === 'requested', 400, 'Booking is not awaiting confirmation');
     cancel(b, 'cancelled_by_provider', body.reason || 'Provider unavailable', 100);
+    c.audit(user, 'booking.reject', b.patient_id, ip, `booking ${b.id}`);
     return get(b.id);
   });
 
   // Lab uploads the report → lands in the patient's records with values.
-  r.post('/api/provider/bookings/:id/report', ({ params, body }) => {
-    const b = get(params.id);
-    must(b && b.provider_type === 'lab', 400, 'Only lab bookings take reports');
+  r.post('/api/provider/bookings/:id/report', { roles: ['lab'] }, ({ user, params, body, ip }) => {
+    const b = ownBooking(user, params.id);
+    must(b.provider_type === 'lab', 400, 'Only lab bookings take reports');
+    c.audit(user, 'lab.report', b.patient_id, ip, `booking ${b.id}`);
     must(['confirmed', 'checked_in', 'in_consult'].includes(b.status), 400, 'Sample not collected yet');
     setStatus(b.id, 'completed');
     c.api.release(b.txn_id);

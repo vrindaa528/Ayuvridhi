@@ -77,9 +77,11 @@ function register(r, c) {
   });
 
   // Doctor issues the e-prescription (Provider Console / doctor app).
-  r.post('/api/provider/consultations/:bookingId/prescription', ({ params, body }) => {
+  r.post('/api/provider/consultations/:bookingId/prescription', { roles: ['doctor'] }, ({ user, params, body, ip }) => {
     const b = c._booking.get(params.bookingId);
     must(b, 404, 'Booking not found');
+    c.access.assertOwns(user, b.provider_id);
+    c.audit(user, 'rx.issue', b.patient_id, ip, `booking ${b.id}`);
     must(['confirmed', 'checked_in', 'in_consult'].includes(b.status), 400, 'Consult is not active');
     const items = (body.items || []).filter((i) => i.drug);
     must(items.length, 400, 'Add at least one medicine');
@@ -137,7 +139,7 @@ function register(r, c) {
 
   // Paper prescription photographed by the patient: stored, then verified by
   // the pharmacist when an order is placed against it.
-  r.post('/api/prescriptions/upload', ({ user, body }) => {
+  r.post('/api/prescriptions/upload', { rate: [{ by: 'user', name: 'upload', limit: 20, windowMs: 60 * 60000 }] }, ({ user, body }) => {
     const patientId = c.consent.resolve(user, body.member_id, 'prescriptions', 'upload prescription');
     const items = (body.items || []).filter((i) => i.drug);
     must(items.length, 400, 'List at least one medicine from the prescription');
@@ -174,7 +176,7 @@ function register(r, c) {
     if (!rx) return null;
     rx.items = json(rx.items, []);
     rx.signed = rx.source === 'e-prescription';
-    rx.signature = rx.signed ? `sig:${(c.deps.hash ? c.deps.hash(rx.id + rx.reg_no) : rx.id).slice(0, 16)}` : null;
+    rx.signature = rx.signed ? `sig:${(c.keyed(rx.id + rx.reg_no)).slice(0, 16)}` : null;
     return rx;
   }
 

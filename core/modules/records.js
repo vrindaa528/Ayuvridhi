@@ -2,7 +2,7 @@
 // records: lifelong timeline (birth → senior care), uploads with
 // auto-categorisation, lab trends, Emergency Card, time-limited sharing.
 
-const { must, json, ageFrom, addMinutes, localDay } = require('../util');
+const { must, json, ageFrom, addMinutes, localDay, validate } = require('../util');
 
 const TYPES = ['prescription', 'lab_report', 'consultation', 'vaccination', 'discharge', 'imaging', 'medicine', 'emergency', 'document', 'milestone'];
 
@@ -75,7 +75,16 @@ function register(r, c) {
     return rec;
   });
 
-  r.post('/api/records', ({ user, body }) => {
+  r.post('/api/records', { rate: [{ by: 'user', name: 'upload', limit: 20, windowMs: 60 * 60000 }] }, ({ user, body }) => {
+    validate(body, {
+      title: { max: 120 },
+      file_name: { max: 200 },
+      type: { max: 30 },
+      date: { max: 10, pattern: /^\d{4}-\d{2}-\d{2}$/, message: 'date must be YYYY-MM-DD' },
+      provider: { max: 120 },
+      member_id: { max: 60 },
+      values: { type: 'array', max: 200 },
+    });
     const patientId = c.consent.resolve(user, body.member_id, 'reports', 'add record');
     const title = body.title || (body.file_name ? body.file_name.replace(/\.[a-z0-9]+$/i, '').replace(/[_-]+/g, ' ') : 'Document');
     const type = TYPES.includes(body.type) ? body.type : classify(`${body.file_name || ''} ${title}`);
@@ -126,12 +135,12 @@ function register(r, c) {
   });
 
   // HR-9: time-limited share link for a doctor outside the platform.
-  r.post('/api/records/:id/share', ({ user, params, body }) => {
+  r.post('/api/records/:id/share', { rate: [{ by: 'user', name: 'share-link', limit: 20, windowMs: 60 * 60000 }] }, ({ user, params, body }) => {
     const rec = db.get('SELECT * FROM records WHERE id = ?', [params.id]);
     must(rec, 404, 'Record not found');
     must(rec.patient_id === user.id || c.consent.isGuardian(user.id, rec.patient_id), 403, 'Only the patient or guardian can share records');
     const minutes = Math.min(7 * 1440, Math.max(15, Number(body.minutes) || 1440));
-    const token = c.util.id('shr');
+    const token = c.util.secureToken(24); // unguessable: this is a bearer secret
     db.run('INSERT INTO consents (id, grantor_id, grantee_id, categories, purpose, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)', [
       token,
       rec.patient_id,

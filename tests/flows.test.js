@@ -24,7 +24,8 @@ function makeCore() {
         return null;
       }
     },
-    hash: (s) => crypto.createHash('sha256').update(`otp:${s}`).digest('hex'),
+    hmac: (m) => crypto.createHmac('sha256', 'test-key').update(m).digest('hex'),
+    demoMode: true,
     demoOtp: '123456',
     autoConfirmSeconds: 0,
   });
@@ -32,6 +33,20 @@ function makeCore() {
   return core;
 }
 const advance = (min) => (clock = new Date(clock.getTime() + min * 60000));
+
+// Demo staff logins (see core/seed.js). Provider actions must come from the
+// account linked to that provider record.
+const STAFF_PHONE = {
+  prv_doc_priya: '9876500051',
+  prv_doc_anil: '9876500052',
+  prv_ph_sanjeevani: '9876500061',
+  prv_ph_healthfirst: '9876500062',
+  prv_ph_apna: '9876500063',
+  prv_lab_pathcare: '9876500071',
+  prv_lab_precision: '9876500072',
+  prv_hosp_metro: '9876500091',
+};
+const staffClient = (core, providerId) => client(core).login(STAFF_PHONE[providerId]);
 
 function client(core) {
   let token = null;
@@ -120,12 +135,13 @@ test('book doctor → confirm → consult → Rx → reminders + record → orde
   assert.equal(b.status, 'requested');
   assert.equal(b.price, 360);
   assert.throws(() => raj.post('/api/bookings', { slot_id: slot.id }), /409/);
-  b = raj.post(`/api/provider/bookings/${b.id}/confirm`);
+  const doc = staffClient(core, anil.id);
+  b = doc.post(`/api/provider/bookings/${b.id}/confirm`);
   assert.equal(b.status, 'confirmed');
   assert.ok(b.token_no);
   const room = raj.post(`/api/consultations/${b.id}/start`);
   assert.ok(room.template.items.length);
-  const rx = raj.post(`/api/provider/consultations/${b.id}/prescription`, { diagnosis: 'URTI', notes: 'rest', items: [{ drug: 'Cetirizine 10mg', dose: '1 tablet', frequency: '0-0-1', food: 'after food', days: 5 }, { drug: 'Paracetamol 650mg', dose: '1 tablet', frequency: '1-0-1', food: 'after food', days: 3 }], follow_up_days: 5 });
+  const rx = doc.post(`/api/provider/consultations/${b.id}/prescription`, { diagnosis: 'URTI', notes: 'rest', items: [{ drug: 'Cetirizine 10mg', dose: '1 tablet', frequency: '0-0-1', food: 'after food', days: 5 }, { drug: 'Paracetamol 650mg', dose: '1 tablet', frequency: '1-0-1', food: 'after food', days: 3 }], follow_up_days: 5 });
   assert.ok(rx.signed);
   const kamla = client(core).login('9876500003');
   assert.ok(kamla.get('/api/schedules').items.some((s) => s.drug === 'Cetirizine 10mg'), 'schedule auto-created');
@@ -135,13 +151,14 @@ test('book doctor → confirm → consult → Rx → reminders + record → orde
   assert.ok(opts[0].all_available);
   let o = raj.post('/api/orders', { prescription_id: rx.id, pharmacy_id: opts[0].pharmacy.id });
   assert.equal(o.status, 'placed');
-  o = raj.post(`/api/provider/orders/${o.id}/verify`, {});
-  o = raj.post(`/api/provider/orders/${o.id}/dispatch`);
+  const pharm = staffClient(core, o.pharmacy_id);
+  o = pharm.post(`/api/provider/orders/${o.id}/verify`, {});
+  o = pharm.post(`/api/provider/orders/${o.id}/dispatch`);
   const tracked = raj.get(`/api/orders/${o.id}`);
   assert.equal(tracked.status, 'dispatched');
   assert.match(tracked.otp, /^\d{4}$/);
-  assert.throws(() => raj.post(`/api/provider/orders/${o.id}/handover`, { otp: '0000' }), /Wrong OTP/);
-  const done = raj.post(`/api/provider/orders/${o.id}/handover`, { otp: tracked.otp });
+  assert.throws(() => pharm.post(`/api/provider/orders/${o.id}/handover`, { otp: '0000' }), /Wrong OTP/);
+  const done = pharm.post(`/api/provider/orders/${o.id}/handover`, { otp: tracked.otp });
   assert.equal(done.status, 'delivered');
   const fin = raj.post(`/api/orders/${o.id}/confirm-receipt`);
   assert.equal(fin.status, 'completed');
@@ -156,7 +173,7 @@ test('substitution needs patient consent; OTC store blocks Rx drugs', () => {
   const opts = raj.get('/api/prescriptions/rx_kamla_1/pharmacies').options;
   const full = opts.find((x) => x.all_available);
   let o = raj.post('/api/orders', { prescription_id: 'rx_kamla_1', pharmacy_id: full.pharmacy.id });
-  o = raj.post(`/api/provider/orders/${o.id}/verify`, { substitute: { from: 'Atorvastatin 10mg', to: 'Atorvastatin 10mg (generic)', unit_price: 3.9 } });
+  o = staffClient(core, o.pharmacy_id).post(`/api/provider/orders/${o.id}/verify`, { substitute: { from: 'Atorvastatin 10mg', to: 'Atorvastatin 10mg (generic)', unit_price: 3.9 } });
   assert.equal(o.status, 'substitution_pending');
   const before = o.total;
   o = raj.post(`/api/orders/${o.id}/substitution`, { approve: true });
@@ -181,8 +198,9 @@ test('lab booking at home, cancellation refund, report with trend', () => {
   assert.equal(c1.status, 'cancelled_by_patient');
   assert.equal(c1.refund_pct, 100);
   const b2 = raj.post('/api/bookings', { slot_id: slots[1].id, service: 'HbA1c', mode: 'home', member_id: 'usr_kamla' });
-  raj.post(`/api/provider/bookings/${b2.id}/confirm`);
-  raj.post(`/api/provider/bookings/${b2.id}/report`, { values: [{ test: 'HbA1c', value: 6.7, unit: '%', ref_range: '< 5.7' }] });
+  const lab2 = staffClient(core, lab.id);
+  lab2.post(`/api/provider/bookings/${b2.id}/confirm`);
+  lab2.post(`/api/provider/bookings/${b2.id}/report`, { values: [{ test: 'HbA1c', value: 6.7, unit: '%', ref_range: '< 5.7' }] });
   const trend = raj.get('/api/records/trends?member=usr_kamla').items.find((t) => t.test === 'HbA1c');
   assert.equal(trend.points.at(-1).value, 6.7);
   assert.ok(trend.points.length >= 5);
@@ -261,11 +279,12 @@ test('wallet: offers, subscription, statement; admin verification', () => {
   raj.post('/api/wallet/subscriptions', { plan: 'chronic_care' });
   assert.equal(raj.get('/api/wallet').subscriptions.length, 2);
   assert.match(raj.get('/api/wallet/statement').csv, /^date,member/);
-  const q = raj.get('/api/admin/providers').items;
+  const ops = client(core).login('9876500099');
+  const q = ops.get('/api/admin/providers').items;
   assert.ok(q.length >= 3);
-  assert.equal(raj.post('/api/admin/providers/prv_doc_vikram/verify', { decision: 'approve' }).status, 'verified');
-  assert.equal(raj.post('/api/admin/providers/prv_doc_sanjay/verify', { decision: 'approve' }).status, 'rejected');
-  const m = raj.get('/api/admin/metrics');
+  assert.equal(ops.post('/api/admin/providers/prv_doc_vikram/verify', { decision: 'approve' }).status, 'verified');
+  assert.equal(ops.post('/api/admin/providers/prv_doc_sanjay/verify', { decision: 'approve' }).status, 'rejected');
+  const m = ops.get('/api/admin/metrics');
   assert.ok(m.verified_providers > 10);
 });
 

@@ -19,7 +19,9 @@ function createRouter() {
         }) +
         '/?$'
     );
-    routes.push({ method, re, keys, handler, auth: opts.auth !== false });
+    // opts.roles: only these users.role values may call it (checked on every request).
+    // opts.rate:  [{ by: 'ip' | 'phone' | 'user', name, limit, windowMs }] rate limits.
+    routes.push({ method, pattern, re, keys, handler, auth: opts.auth !== false, roles: opts.roles || null, rate: opts.rate || null });
   }
 
   function match(method, path) {

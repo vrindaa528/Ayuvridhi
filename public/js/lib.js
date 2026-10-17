@@ -9,21 +9,46 @@ const store = {
   del(k) { try { localStorage.removeItem('ay.' + k); } catch (e) { /* ignore */ } },
 };
 
-const S = { token: store.get('token', null), me: null, family: null, member: null, unread: 0 };
+const S = { token: store.get('token', null), me: null, family: null, member: null, unread: 0, roleTokens: {}, consoleRole: 'doctor' };
 
-async function api(method, path, body) {
-  let status, data;
+// Staff screens (/api/provider, /api/admin) act with a staff login. In the demo
+// the Partner console signs in as a seeded staff user with /api/demo/partner-token.
+// In production each staff role signs in with its own OTP (see Phase 5).
+function roleFor(path) {
+  if (path.startsWith('/api/admin/')) return 'ops';
+  if (path.startsWith('/api/provider/')) return S.consoleRole || 'doctor';
+  return null;
+}
+
+async function rawCall(method, path, body, token) {
   const headers = { 'Content-Type': 'application/json' };
-  if (S.token) headers.authorization = 'Bearer ' + S.token;
+  if (token) headers.authorization = 'Bearer ' + token;
   if (window.AY_TRANSPORT) {
     const out = await window.AY_TRANSPORT(method, path, body, headers);
-    status = out.status; data = out.body;
-  } else {
-    const res = await fetch(path, { method, headers, body: body ? JSON.stringify(body) : undefined });
-    status = res.status;
-    data = await res.json().catch(() => ({}));
+    return { status: out.status, data: out.body };
   }
-  if (status === 401 && !path.startsWith('/api/auth')) { logout(); throw new Error('Please log in again'); }
+  const res = await fetch(path, { method, headers, body: body ? JSON.stringify(body) : undefined });
+  return { status: res.status, data: await res.json().catch(() => ({})) };
+}
+
+async function staffToken(role) {
+  if (S.roleTokens[role]) return S.roleTokens[role];
+  const out = await rawCall('POST', '/api/demo/partner-token', { role }, null);
+  if (out.status >= 400) { const e = new Error(out.data.error || 'Staff sign-in is not available'); e.status = out.status; throw e; }
+  S.roleTokens[role] = out.data.token;
+  return S.roleTokens[role];
+}
+
+async function api(method, path, body) {
+  const role = roleFor(path);
+  let token = S.token;
+  if (role) {
+    token = await staffToken(role);
+  }
+  let out = await rawCall(method, path, body, token);
+  if (role && out.status === 401) { delete S.roleTokens[role]; token = await staffToken(role); out = await rawCall(method, path, body, token); }
+  const status = out.status; const data = out.data;
+  if (status === 401 && !role && !path.startsWith('/api/auth')) { logout(); throw new Error('Please log in again'); }
   if (status >= 400) { const e = new Error(data.error || 'Something went wrong'); e.status = status; e.data = data; throw e; }
   return data;
 }

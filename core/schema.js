@@ -5,9 +5,16 @@ module.exports = `
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY, phone TEXT UNIQUE, name TEXT, dob TEXT, sex TEXT,
   language TEXT DEFAULT 'en', abha_id TEXT, blood_group TEXT, city TEXT,
-  lat REAL, lng REAL, created_at TEXT
+  lat REAL, lng REAL, role TEXT DEFAULT 'patient', created_at TEXT
 );
-CREATE TABLE IF NOT EXISTS otps (phone TEXT PRIMARY KEY, code TEXT, expires_at TEXT, attempts INTEGER DEFAULT 0);
+-- Login codes are stored as a keyed hash (HMAC with a server-held key), never plaintext.
+-- mode: 'code' (we generated it) or 'external' (the SMS provider checks it).
+CREATE TABLE IF NOT EXISTS otps (phone TEXT PRIMARY KEY, code_hash TEXT, mode TEXT DEFAULT 'code', expires_at TEXT, attempts INTEGER DEFAULT 0);
+-- Which provider record a staff login acts for. Every /api/provider/* call
+-- checks this table, so a doctor can only touch their own bookings.
+CREATE TABLE IF NOT EXISTS provider_accounts (
+  user_id TEXT, provider_id TEXT, role TEXT, created_at TEXT, PRIMARY KEY (user_id, provider_id)
+);
 CREATE TABLE IF NOT EXISTS families (id TEXT PRIMARY KEY, name TEXT, leader_id TEXT);
 CREATE TABLE IF NOT EXISTS family_members (
   family_id TEXT, user_id TEXT, role TEXT, relation TEXT, PRIMARY KEY (family_id, user_id)
@@ -17,7 +24,8 @@ CREATE TABLE IF NOT EXISTS consents (
   expires_at TEXT, revoked_at TEXT, created_at TEXT
 );
 CREATE TABLE IF NOT EXISTS access_logs (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, actor_id TEXT, patient_id TEXT, category TEXT, purpose TEXT, at TEXT
+  id INTEGER PRIMARY KEY AUTOINCREMENT, actor_id TEXT, patient_id TEXT, category TEXT, purpose TEXT, at TEXT,
+  action TEXT, ip TEXT
 );
 CREATE TABLE IF NOT EXISTS providers (
   id TEXT PRIMARY KEY, type TEXT, name TEXT, specialty TEXT, qualification TEXT, reg_no TEXT,
@@ -52,7 +60,7 @@ CREATE TABLE IF NOT EXISTS stock (
 CREATE TABLE IF NOT EXISTS orders (
   id TEXT PRIMARY KEY, patient_id TEXT, placed_by TEXT, pharmacy_id TEXT, prescription_id TEXT,
   items TEXT, status TEXT, subtotal INTEGER, delivery_fee INTEGER, total INTEGER, txn_id TEXT,
-  otp_hash TEXT, otp_plain TEXT, substitution TEXT, created_at TEXT, updated_at TEXT
+  otp_hash TEXT, substitution TEXT, created_at TEXT, updated_at TEXT
 );
 CREATE TABLE IF NOT EXISTS deliveries (
   order_id TEXT PRIMARY KEY, partner TEXT, status TEXT, from_lat REAL, from_lng REAL,
